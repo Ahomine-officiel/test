@@ -2,7 +2,10 @@
 """
 CloudSync Server - Serveur cloud auto-hébergé pour le mod Minecraft CloudSync.
 
-Modifié pour utiliser un TOKEN STATIQUE et tourner sur Hugging Face Spaces 24/7.
+Modifié pour Render / PaaS :
+- Token statique
+- Support de la méthode HTTP HEAD (résout les pings Uptime/Render)
+- Prise en compte dynamique de la variable d'environnement PORT
 """
 
 import argparse
@@ -12,8 +15,6 @@ import re
 import secrets
 import ssl
 import sys
-import threading
-import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,7 +32,7 @@ DEFAULT_STATIC_TOKEN = "MON_SUPER_TOKEN_SECRET_123"
 # =============================================================================
 
 class Config:
-    """Configuration du serveur (parsée depuis argv)."""
+    """Configuration du serveur (parsée depuis argv / env)."""
     token: str = DEFAULT_STATIC_TOKEN
     host: str = "0.0.0.0"
     port: int = 8080
@@ -114,7 +115,7 @@ class CloudSyncHandler(BaseHTTPRequestHandler):
 
     def send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, Content-Length")
 
     def send_json(self, status: int, data: dict):
@@ -129,10 +130,34 @@ class CloudSyncHandler(BaseHTTPRequestHandler):
     def send_error_json(self, status: int, message: str):
         self.send_json(status, {"error": message})
 
+    # -------------------------------------------------------------------------
+    #  OPTIONS (CORS preflight)
+    # -------------------------------------------------------------------------
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_cors_headers()
         self.end_headers()
+
+    # -------------------------------------------------------------------------
+    #  HEAD (Prise en charge des Pings Render / UptimeRobot)
+    # -------------------------------------------------------------------------
+
+    def do_HEAD(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/api/health" or path == "/" or path == "":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_cors_headers()
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    # -------------------------------------------------------------------------
+    #  GET
+    # -------------------------------------------------------------------------
 
     def do_GET(self):
         if self.path == "/api/health":
@@ -172,6 +197,7 @@ class CloudSyncHandler(BaseHTTPRequestHandler):
         if path == "/" or path == "":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_cors_headers()
             self.end_headers()
             self.wfile.write(b"<!DOCTYPE html><html><body><h1>CloudSync Server</h1><p>OK</p></body></html>")
             return
@@ -220,6 +246,10 @@ class CloudSyncHandler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 self.wfile.write(chunk)
+
+    # -------------------------------------------------------------------------
+    #  PUT (Upload)
+    # -------------------------------------------------------------------------
 
     def do_PUT(self):
         if not self.check_auth():
@@ -277,6 +307,10 @@ class CloudSyncHandler(BaseHTTPRequestHandler):
             "md5Checksum": None,
         })
 
+    # -------------------------------------------------------------------------
+    #  DELETE
+    # -------------------------------------------------------------------------
+
     def do_DELETE(self):
         if not self.check_auth():
             self.send_unauthorized()
@@ -291,18 +325,22 @@ class CloudSyncHandler(BaseHTTPRequestHandler):
                 name = sanitize_name(name)
             except ValueError as e:
                 self.send_error_json(400, str(e))
-            return
+                return
+
             data_path = file_data_path(name)
             meta_path = file_meta_path(name)
             deleted = False
+
             if data_path.exists():
                 data_path.unlink()
                 deleted = True
             if meta_path.exists():
                 meta_path.unlink()
+
             if not deleted:
                 self.send_error_json(404, f"Fichier introuvable: {name}")
                 return
+
             self.send_json(200, {"deleted": name})
             return
 
@@ -315,51 +353,18 @@ class CloudSyncServer(ThreadingHTTPServer):
 
 
 # =============================================================================
-#  Serveur Web de garde pour Hugging Face (Port 7860)
+#  Point d'entrée
 # =============================================================================
 
-class HFKeepAliveHandler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass  # Désactive les logs du keep-alive pour garder la console propre
-
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head><title>CloudSync Server</title></head>
-        <body style="font-family: sans-serif; padding: 20px;">
-            <h1>☁️ CloudSync Server est actif 24/7</h1>
-            <p><strong>Port d'écoute API :</strong> {Config.port}</p>
-            <p><strong>Token d'authentification :</strong> <code>{Config.token}</code></p>
-        </body>
-        </html>
-        """
-        self.wfile.write(html.encode('utf-8'))
-
-
-def run_cloudsync():
-    """Lance le serveur principal CloudSync."""
-    Config.data_dir.mkdir(parents=True, exist_ok=True)
-    server = CloudSyncServer((Config.host, Config.port), CloudSyncHandler)
-    print("=" * 70)
-    print("  ☁  CloudSync Server")
-    print("=" * 70)
-    print(f"  Port API : {Config.port}")
-    print(f"  Stockage : {Config.data_dir}")
-    print(f"  ★ Token Statique : {Config.token}")
-    print("=" * 70)
-    server.serve_forever()
-
-
 def main():
+    # Détection automatique du port d'environnement (utilisé par Render, Koyeb, etc.)
+    env_port = int(os.environ.get("PORT", 8080))
+
     parser = argparse.ArgumentParser(description="CloudSync Server")
     parser.add_argument("--token", "-t", default=DEFAULT_STATIC_TOKEN,
                         help=f"Token d'authentification (statique par défaut: {DEFAULT_STATIC_TOKEN})")
     parser.add_argument("--host", default="0.0.0.0", help="Host d'écoute")
-    parser.add_argument("--port", "-p", type=int, default=8080, help="Port d'écoute (défaut: 8080)")
+    parser.add_argument("--port", "-p", type=int, default=env_port, help=f"Port d'écoute (défaut: {env_port})")
     parser.add_argument("--data-dir", "-d", default="./data", help="Dossier de stockage")
 
     args, _ = parser.parse_known_args()
@@ -368,20 +373,24 @@ def main():
     Config.host = args.host
     Config.port = args.port
     Config.data_dir = Path(args.data_dir).resolve()
+    Config.data_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Lancer CloudSync dans un Thread séparé en arrière-plan
-    sync_thread = threading.Thread(target=run_cloudsync, daemon=True)
-    sync_thread.start()
+    server = CloudSyncServer((Config.host, Config.port), CloudSyncHandler)
 
-    # 2. Lancer un micro-serveur sur le port 7860 (port attendu par Hugging Face Spaces)
-    hf_port = int(os.environ.get("PORT", 7860))
-    hf_server = ThreadingHTTPServer(("0.0.0.0", hf_port), HFKeepAliveHandler)
-    print(f"  [HF Keep-Alive] Serveur de garde actif sur le port {hf_port}")
-    
+    print("=" * 70)
+    print("  ☁  CloudSync Server")
+    print("=" * 70)
+    print(f"  Port d'écoute : {Config.port}")
+    print(f"  Stockage      : {Config.data_dir}")
+    print(f"  ★ Token       : {Config.token}")
+    print("=" * 70)
+
     try:
-        hf_server.serve_forever()
+        server.serve_forever()
     except KeyboardInterrupt:
         print("\nArrêt du serveur...")
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":
